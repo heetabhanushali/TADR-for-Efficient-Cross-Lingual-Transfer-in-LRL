@@ -16,7 +16,7 @@ class TypologicalFeatureLoader:
     Features can come from WALS or be computationally derived.
     """
     
-    def __init__(self, feature_file: str, feature_names: Optional[List[str]] = None):
+    def __init__(self, feature_file: str, feature_names: Optional[List[str]] = None , missing_value_strategy: str = 'zero'):
         """
         Args:
             feature_file: Path to CSV/JSON with typological features
@@ -26,6 +26,7 @@ class TypologicalFeatureLoader:
         self.feature_data = self._load_features(feature_file)
         self.feature_names = feature_names or self._get_all_features()
         self.feature_dim = len(self.feature_names)
+        self.missing_value_strategy = missing_value_strategy
         
         print(f"Loaded {len(self.feature_data)} languages")
         print(f"Feature dimension: {self.feature_dim}")
@@ -42,7 +43,7 @@ class TypologicalFeatureLoader:
     def _get_all_features(self) -> List[str]:
         """Get all feature column names."""
         # Exclude metadata columns
-        exclude = ['language', 'iso_code', 'lang_id', 'name']
+        exclude = ['language', 'iso_code', 'lang_id', 'name', 'latitude', 'longitude']
         return [col for col in self.feature_data.columns if col not in exclude]
     
     def get_feature_vector(self, lang_id: str) -> np.ndarray:
@@ -64,7 +65,13 @@ class TypologicalFeatureLoader:
         features = lang_data[self.feature_names].values[0]
         
         # Handle missing values (NaN) with zeros
-        features = np.nan_to_num(features, nan=0.0)
+        if self.missing_value_strategy == 'zero':
+            features = np.nan_to_num(features, nan=0.0)
+        elif self.missing_value_strategy == 'mean':
+            for i , feat_name in enumerate(self.feature_names):
+                if np.isnan(features[i]):
+                    mean_val = self.feature_data[feat_name].mean()
+                    features[i] = mean_val if not np.isnan(mean_val) else 0.0
         
         return features.astype(np.float32)
     
@@ -88,7 +95,8 @@ class TypologyEmbedding(nn.Module):
                  feature_dim: int,
                  embedding_dim: int = 128,
                  hidden_dim: int = 256,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 use_feature_weights: bool = True):
         """
         Args:
             feature_dim: Dimension of raw feature vector
@@ -97,6 +105,11 @@ class TypologyEmbedding(nn.Module):
             dropout: Dropout probability
         """
         super().__init__()
+
+        if use_feature_weights:
+            self.feature_weights = nn.Parameter(torch.ones(feature_dim))
+        else:
+            self.register_buffer('feature_weights', torch.ones(feature_dim))
         
         self.feature_dim = feature_dim
         self.embedding_dim = embedding_dim
@@ -120,7 +133,8 @@ class TypologyEmbedding(nn.Module):
         Returns:
             embeddings: Tensor of shape (batch_size, embedding_dim)
         """
-        return self.mlp(features)
+        weighted_features = features * self.feature_weights
+        return self.mlp(weighted_features)
 
 
 class TypologyFeatureModule(nn.Module):
@@ -205,107 +219,3 @@ class TypologyFeatureModule(nn.Module):
         """Clear the embedding cache."""
         self.embedding_cache = {}
 
-
-# ============================================================================
-# EXAMPLE USAGE AND TESTING
-# ============================================================================
-
-def create_sample_data():
-    """Create sample typological data for testing."""
-    # Sample WALS-like features for 5 languages
-    data = {
-        'iso_code': ['en', 'hi', 'zh', 'ar', 'sw'],
-        'language': ['English', 'Hindi', 'Chinese', 'Arabic', 'Swahili'],
-        # Word order: 1=SVO, 6=SOV, etc.
-        'word_order': [1, 6, 1, 4, 1],
-        # Morphological fusion: 1-9 scale
-        'morphology_fusion': [2, 8, 1, 7, 5],
-        # Case marking: 0-10 scale
-        'case_marking': [1, 8, 0, 6, 5],
-        # Gender system: 0-10 scale
-        'gender_system': [3, 2, 0, 3, 7],
-        # Consonant inventory: number of consonants
-        'consonant_inventory': [24, 29, 22, 28, 33],
-        # Vowel inventory: number of vowels
-        'vowel_inventory': [14, 10, 5, 6, 5],
-    }
-    
-    df = pd.DataFrame(data)
-    df.to_csv('sample_typology_features.csv', index=False)
-    print("Created sample_typology_features.csv")
-    return df
-
-
-def test_module():
-    """Test the typological feature module."""
-    print("="*60)
-    print("Testing Typological Feature Module")
-    print("="*60)
-    
-    # Create sample data
-    create_sample_data()
-    
-    # Initialize feature loader
-    print("\n1. Initializing Feature Loader...")
-    feature_loader = TypologicalFeatureLoader(
-        feature_file='sample_typology_features.csv',
-        feature_names=['word_order', 'morphology_fusion', 'case_marking', 
-                      'gender_system', 'consonant_inventory', 'vowel_inventory']
-    )
-    
-    # Test feature extraction
-    print("\n2. Testing Feature Extraction...")
-    en_features = feature_loader.get_feature_vector('en')
-    print(f"English features: {en_features}")
-    
-    hi_features = feature_loader.get_feature_vector('hi')
-    print(f"Hindi features: {hi_features}")
-    
-    # Initialize embedding module
-    print("\n3. Initializing Typology Embedding Module...")
-    typo_module = TypologyFeatureModule(
-        feature_loader=feature_loader,
-        embedding_dim=128,
-        hidden_dim=256,
-        dropout=0.1
-    )
-    
-    # Test single language embedding
-    print("\n4. Testing Single Language Embedding...")
-    en_embedding = typo_module.get_embedding('en')
-    print(f"English embedding shape: {en_embedding.shape}")
-    print(f"English embedding (first 10 dims): {en_embedding[:10]}")
-    
-    # Test batch processing
-    print("\n5. Testing Batch Processing...")
-    lang_batch = ['en', 'hi', 'zh']
-    batch_embeddings = typo_module(lang_batch)
-    print(f"Batch embeddings shape: {batch_embeddings.shape}")
-    
-    # Test unknown language
-    print("\n6. Testing Unknown Language...")
-    unknown_emb = typo_module.get_embedding('xyz')
-    print(f"Unknown language embedding shape: {unknown_emb.shape}")
-    
-    # Compute typological similarities
-    print("\n7. Computing Typological Similarities...")
-    def cosine_similarity(lang1, lang2):
-        emb1 = typo_module.get_embedding(lang1)
-        emb2 = typo_module.get_embedding(lang2)
-        similarity = torch.nn.functional.cosine_similarity(
-            emb1.unsqueeze(0), emb2.unsqueeze(0)
-        )
-        return similarity.item()
-    
-    print(f"EN-HI similarity: {cosine_similarity('en', 'hi'):.4f}")
-    print(f"EN-ZH similarity: {cosine_similarity('en', 'zh'):.4f}")
-    print(f"HI-ZH similarity: {cosine_similarity('hi', 'zh'):.4f}")
-    print(f"EN-AR similarity: {cosine_similarity('en', 'ar'):.4f}")
-    
-    print("\n" + "="*60)
-    print("✅ All tests passed!")
-    print("="*60)
-
-
-if __name__ == "__main__":
-    test_module()

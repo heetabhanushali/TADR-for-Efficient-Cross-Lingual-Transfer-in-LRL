@@ -1,6 +1,6 @@
 """
 TADR Framework - Step 5: Integration Layer
-Complete TADR model combining all components
+Complete TADR model combining all components with advanced dynamic routing
 """
 
 import torch
@@ -8,36 +8,42 @@ import torch.nn as nn
 from typing import Optional, Dict, List, Tuple, Any
 import warnings
 
-# Import previous components
-# In practice, these would be: from step1_typology_module import ...
-# For this demo, we'll include minimal versions or assume imports
+# Import all previous components
+from step1_typology_module import TypologicalFeatureLoader, TypologyFeatureModule
+from step2_base_model import ModelWithAdapterSlots, DEFAULT_MODEL_NAME
+from step3_adapter_modules import MultiAdapterModule
+from step4_routing_network import DynamicRouter, ContextExtractor, LoadBalancingLoss
 
+
+# ============================================================================
+# TADR LAYER
+# ============================================================================
 
 class TADRLayer(nn.Module):
     """
-    Single TADR layer: combines transformer layer with dynamic adapters.
+    Single TADR layer combining transformer layer with dynamic adapters and routing.
     
     Flow:
-        Input → Attention → [Adapter Route] → FFN → [Adapter Route] → Output
+        Input → Transformer Layer → Extract Context → Route → Apply Adapters → Output
     """
     
     def __init__(
         self,
         transformer_layer: nn.Module,
-        multi_adapter: nn.Module,  # From step3_adapter_modules
-        router: nn.Module,  # From step4_routing_network
-        context_extractor: nn.Module,  # From step4_routing_network
+        multi_adapter: MultiAdapterModule,
+        router: DynamicRouter,
+        context_extractor: ContextExtractor,
         apply_after_attention: bool = False,
         apply_after_ffn: bool = True
     ):
         """
         Args:
-            transformer_layer: Original transformer layer (frozen)
+            transformer_layer: Original transformer layer from base model
             multi_adapter: MultiAdapterModule with K adapters
-            router: DynamicRouter for computing weights
-            context_extractor: Extract context from hidden states
-            apply_after_attention: Whether to route after attention
-            apply_after_ffn: Whether to route after FFN
+            router: DynamicRouter for computing routing weights
+            context_extractor: Extracts context features from hidden states
+            apply_after_attention: Whether to apply adapters after attention
+            apply_after_ffn: Whether to apply adapters after FFN (standard)
         """
         super().__init__()
         
@@ -49,7 +55,7 @@ class TADRLayer(nn.Module):
         self.apply_after_attention = apply_after_attention
         self.apply_after_ffn = apply_after_ffn
         
-        # Cache for routing weights (for analysis)
+        # Cache for analysis
         self.last_routing_weights = None
     
     def forward(
@@ -70,149 +76,183 @@ class TADRLayer(nn.Module):
         
         Returns:
             output_hidden_states: (batch_size, seq_len, hidden_size)
-            routing_info: Dict with routing weights, entropy, etc. (if requested)
+            routing_info: Dict with routing weights and statistics (if requested)
         """
         # Extract context features for routing
         context_features = self.context_extractor(hidden_states, attention_mask)
         
-        # Compute routing weights
-        routing_weights, _ = self.router(typology_embedding, context_features)
+        # Compute routing weights from typology + context
+        routing_weights, logits = self.router(
+            typology_embedding, 
+            context_features,
+            return_logits=True
+        )
         self.last_routing_weights = routing_weights.detach()
         
         # Pass through original transformer layer
-        # Note: This is a simplified version. Real implementation needs to handle
-        # transformer layer's internal structure (attention, FFN, etc.)
-
-        # layer_output = self.transformer_layer(hidden_states, attention_mask)[0]
-        layer_output = self.transformer_layer(hidden_states, attention_mask=attention_mask)[0]
-
+        layer_output = self.transformer_layer(
+            hidden_states, 
+            attention_mask=attention_mask
+        )[0]
         
-        # Apply routed adapters after FFN (standard placement)
+        # Apply routed adapters (standard placement: after FFN)
         if self.apply_after_ffn:
             layer_output = self.multi_adapter(layer_output, routing_weights)
         
         # Prepare routing info if requested
         routing_info = None
         if return_routing_info:
+            epsilon = 1e-10
             routing_info = {
                 'weights': routing_weights,
-                'entropy': -(routing_weights * torch.log(routing_weights + 1e-10)).sum(dim=-1),
+                'logits': logits,
+                'entropy': -(routing_weights * torch.log(routing_weights + epsilon)).sum(dim=-1),
                 'sparsity': (routing_weights > 1e-5).sum(dim=-1).float(),
-                'top_adapter': routing_weights.argmax(dim=-1)
+                'top_adapter': routing_weights.argmax(dim=-1),
+                'max_weight': routing_weights.max(dim=-1)[0]
             }
         
         return layer_output, routing_info
 
 
-class TADRModel(nn.Module):
+# ============================================================================
+# COMPLETE TADR MODEL
+# ============================================================================
+
+class CompleteTADRModel(nn.Module):
     """
     Complete TADR Model: Typology-Aware Dynamic Routing for Multilingual NLP.
+    
+    This is the advanced version with context-aware routing (Step 5).
+    For simpler typology-only routing, use TADRModel from step3_adapters.py.
     
     Architecture:
         Input → Embeddings → [TADR Layer 1] → ... → [TADR Layer N] → Output
         
     Each TADR layer:
-        - Extracts context
-        - Routes based on typology + context
-        - Applies weighted adapters
+        1. Passes through transformer layer
+        2. Extracts context from hidden states
+        3. Routes based on typology + context
+        4. Applies weighted adapters
     """
     
     def __init__(
         self,
-        base_model: nn.Module,  # From step2_base_model (XLM-R/mBERT)
-        typology_module: nn.Module,  # From step1_typology_module
-        adapter_config: Dict[str, Any],
-        router_config: Dict[str, Any],
-        num_classes: Optional[int] = None,  # For classification tasks
-        layer_indices: Optional[List[int]] = None  # Which layers get adapters
+        model_name: str = DEFAULT_MODEL_NAME,
+        feature_file: str = 'wals_features.csv',
+        # Typology config
+        typology_embedding_dim: int = 128,
+        typology_hidden_dim: int = 256,
+        # Adapter config
+        num_adapters: int = 10,
+        adapter_bottleneck_size: int = 64,
+        adapter_non_linearity: str = "relu",
+        adapter_dropout: float = 0.1,
+        # Router config
+        router_hidden_dims: List[int] = None,
+        router_dropout: float = 0.1,
+        gating_type: str = "softmax",
+        gating_config: Optional[Dict] = None,
+        pooling_type: str = "cls",
+        # General config
+        num_adapter_layers: Optional[int] = None,
+        num_classes: Optional[int] = None,
+        device: Optional[str] = None
     ):
         """
         Args:
-            base_model: Pre-trained multilingual model (frozen)
-            typology_module: Typology feature module
-            adapter_config: Configuration for adapters
-            router_config: Configuration for router
+            model_name: HuggingFace model identifier
+            feature_file: Path to typological features CSV
+            typology_embedding_dim: Dimension of typology embeddings
+            typology_hidden_dim: Hidden dimension for typology MLP
+            num_adapters: Number of adapters per layer
+            adapter_bottleneck_size: Bottleneck dimension for adapters
+            adapter_non_linearity: Activation function for adapters
+            adapter_dropout: Dropout for adapters
+            router_hidden_dims: Hidden dimensions for router MLP
+            router_dropout: Dropout for router
+            gating_type: Type of gating mechanism
+            gating_config: Configuration for gating
+            pooling_type: Context pooling strategy
+            num_adapter_layers: Number of layers to add adapters to
             num_classes: Number of output classes (for classification)
-            layer_indices: Layers to add TADR to (None = all layers)
+            device: Device to use
         """
         super().__init__()
         
-        self.base_model = base_model
-        self.typology_module = typology_module
-        self.num_classes = num_classes
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        router_hidden_dims = router_hidden_dims or [256, 128]
         
-        # Get model dimensions
-        self.hidden_size = base_model.config.hidden_size
-        self.num_layers = base_model.config.num_hidden_layers
+        print("="*70)
+        print("Initializing Complete TADR Model (Advanced Version)")
+        print("="*70)
         
-        # Determine which layers get TADR
-        if layer_indices is None:
-            self.layer_indices = list(range(self.num_layers))
-        else:
-            self.layer_indices = layer_indices
+        # ========================
+        # Step 1: Typology Module
+        # ========================
+        feature_loader = TypologicalFeatureLoader(
+            feature_file=feature_file,
+            missing_value_strategy='mean'
+        )
+        self.typology_module = TypologyFeatureModule(
+            feature_loader=feature_loader,
+            embedding_dim=typology_embedding_dim,
+            hidden_dim=typology_hidden_dim
+        )
         
-        print(f"Initializing TADR Model:")
-        print(f"  Base model: {base_model.config.model_type}")
-        print(f"  Hidden size: {self.hidden_size}")
-        print(f"  Total layers: {self.num_layers}")
-        print(f"  TADR layers: {len(self.layer_indices)}")
+        # ========================
+        # Step 2: Base Model
+        # ========================
+        self.base_model_wrapper = ModelWithAdapterSlots(
+            model_name=model_name,
+            freeze_base=True,
+            num_adapter_layers=num_adapter_layers,
+            device=self.device
+        )
         
-        # Initialize TADR layers
-        self._init_tadr_layers(adapter_config, router_config)
+        self.base_model = self.base_model_wrapper.model
+        self.config = self.base_model_wrapper.config
+        self.hidden_size = self.base_model_wrapper.hidden_size
+        self.num_layers = self.base_model_wrapper.num_layers
+        self.adapter_layer_indices = self.base_model_wrapper.adapter_layer_indices
+        self.num_adapter_layers = len(self.adapter_layer_indices)
         
-        # Classification head (if needed)
-        if num_classes is not None:
-            self.classifier = nn.Linear(self.hidden_size, num_classes)
-        else:
-            self.classifier = None
-        
-        # Freeze base model
-        self._freeze_base_model()
-        
-        print(f"  Total parameters: {self.get_total_params():,}")
-        print(f"  Trainable parameters: {self.get_trainable_params():,}")
-        print(f"  Trainable %: {self.get_trainable_params()/self.get_total_params()*100:.2f}%")
-    
-    def _init_tadr_layers(
-        self,
-        adapter_config: Dict[str, Any],
-        router_config: Dict[str, Any]
-    ):
-        """Initialize TADR layers for each transformer layer."""
-        from step3_adapter_modules import MultiAdapterModule
-        from step4_routing_network import DynamicRouter, ContextExtractor
-        
+        # ========================
+        # Steps 3 & 4: TADR Layers
+        # ========================
         self.tadr_layers = nn.ModuleList()
         
-        for layer_idx in self.layer_indices:
-            # Create multi-adapter module
+        for layer_idx in self.adapter_layer_indices:
+            # Multi-adapter module
             multi_adapter = MultiAdapterModule(
-                num_adapters=adapter_config['num_adapters'],
+                num_adapters=num_adapters,
                 hidden_size=self.hidden_size,
-                bottleneck_size=adapter_config.get('bottleneck_size', 64),
-                non_linearity=adapter_config.get('non_linearity', 'relu'),
-                dropout=adapter_config.get('dropout', 0.1)
+                bottleneck_size=adapter_bottleneck_size,
+                non_linearity=adapter_non_linearity,
+                dropout=adapter_dropout
             )
             
-            # Create router
+            # Dynamic router (typology + context)
             router = DynamicRouter(
-                typology_dim=self.typology_module.embedding_dim,
+                typology_dim=typology_embedding_dim,
                 context_dim=self.hidden_size,
-                num_adapters=adapter_config['num_adapters'],
-                hidden_dims=router_config.get('hidden_dims', [256, 128]),
-                dropout=router_config.get('dropout', 0.1),
-                gating_type=router_config.get('gating_type', 'softmax'),
-                gating_config=router_config.get('gating_config', {})
+                num_adapters=num_adapters,
+                hidden_dims=router_hidden_dims,
+                dropout=router_dropout,
+                gating_type=gating_type,
+                gating_config=gating_config or {}
             )
             
-            # Create context extractor
+            # Context extractor
             context_extractor = ContextExtractor(
                 hidden_size=self.hidden_size,
-                pooling_type=router_config.get('pooling_type', 'cls')
+                pooling_type=pooling_type
             )
             
             # Get transformer layer
-            transformer_layer = self.base_model.encoder.layer[layer_idx]
+            transformer_layer = self.base_model_wrapper.encoder_layers[
+                self.adapter_layer_indices.index(layer_idx)
+            ]
             
             # Create TADR layer
             tadr_layer = TADRLayer(
@@ -224,191 +264,257 @@ class TADRModel(nn.Module):
             )
             
             self.tadr_layers.append(tadr_layer)
+        
+        # ========================
+        # Classification head
+        # ========================
+        self.num_classes = num_classes
+        if num_classes is not None:
+            self.classifier = nn.Linear(self.hidden_size, num_classes)
+        else:
+            self.classifier = None
+        
+        # Move to device
+        self.to(self.device)
+        
+        # Print summary
+        self._print_summary()
     
-    def _freeze_base_model(self):
-        """Freeze all base model parameters."""
-        for param in self.base_model.parameters():
-            param.requires_grad = False
+    def _print_summary(self):
+        """Print model configuration summary."""
+        total_params = self.count_parameters()
+        trainable_params = self.count_trainable_parameters()
+        adapter_params = self.count_adapter_parameters()
+        router_params = self.count_router_parameters()
+        
+        print(f"\n✅ Model Configuration:")
+        print(f"  Base model: {self.base_model_wrapper.model_name}")
+        print(f"  Hidden size: {self.hidden_size}")
+        print(f"  Total transformer layers: {self.num_layers}")
+        print(f"  TADR layers: {self.num_adapter_layers} at indices {self.adapter_layer_indices}")
+        
+        if self.classifier is not None:
+            print(f"  Task: Classification ({self.num_classes} classes)")
+        
+        print(f"\n📊 Parameters:")
+        print(f"  Total: {total_params:,}")
+        print(f"  Trainable: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+        print(f"  ├─ Adapters: {adapter_params:,} ({adapter_params/trainable_params*100:.1f}% of trainable)")
+        print(f"  ├─ Routers: {router_params:,} ({router_params/trainable_params*100:.1f}% of trainable)")
+        if self.classifier is not None:
+            classifier_params = sum(p.numel() for p in self.classifier.parameters())
+            print(f"  └─ Classifier: {classifier_params:,}")
+        
+        print("="*70 + "\n")
+    
+    def count_parameters(self) -> int:
+        """Count total parameters."""
+        return sum(p.numel() for p in self.parameters())
+    
+    def count_trainable_parameters(self) -> int:
+        """Count trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+    def count_adapter_parameters(self) -> int:
+        """Count adapter parameters."""
+        return sum(
+            p.numel() 
+            for layer in self.tadr_layers 
+            for p in layer.multi_adapter.parameters()
+        )
+    
+    def count_router_parameters(self) -> int:
+        """Count router parameters."""
+        return sum(
+            p.numel() 
+            for layer in self.tadr_layers 
+            for p in layer.router.parameters()
+        )
     
     def forward(
         self,
+        lang_ids: List[str],
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        language_ids: Optional[List[str]] = None,
-        typology_embeddings: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
         return_routing_info: bool = False,
-        **kwargs
-    ) -> Dict[str, torch.Tensor]:
+        return_dict: bool = True
+    ) -> Dict[str, Any]:
         """
-        Forward pass through TADR model.
+        Forward pass through complete TADR model.
         
         Args:
-            input_ids: (batch_size, seq_len)
-            attention_mask: (batch_size, seq_len)
-            language_ids: List of language codes (e.g., ['en', 'hi', 'zh'])
-            typology_embeddings: Pre-computed embeddings (batch_size, typology_dim)
+            lang_ids: List of language ISO codes for the batch
+            input_ids: Input token IDs (batch_size, seq_len)
+            attention_mask: Attention mask (batch_size, seq_len)
+            token_type_ids: Token type IDs (batch_size, seq_len)
             return_routing_info: Whether to return routing diagnostics
+            return_dict: Whether to return as dict
         
         Returns:
             Dictionary containing:
-                - logits: (batch_size, num_classes) if classifier exists
-                - hidden_states: (batch_size, seq_len, hidden_size)
-                - cls_embedding: (batch_size, hidden_size)
-                - routing_info: List of dicts (if requested)
+                - last_hidden_state: Final hidden states
+                - pooler_output: Pooled output (CLS token)
+                - logits: Classification logits (if classifier exists)
+                - hidden_states: All layer hidden states
+                - routing_info: Routing information per layer (if requested)
         """
+        # Move inputs to device
+        input_ids = input_ids.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.to(self.device)
+        
         batch_size = input_ids.size(0)
         
         # Get typology embeddings
-        if typology_embeddings is None:
-            if language_ids is None:
-                raise ValueError("Must provide either language_ids or typology_embeddings")
-            typology_embeddings = self.typology_module(language_ids)
+        typology_embeddings = self.typology_module(lang_ids)
+        typology_embeddings = typology_embeddings.to(self.device)
         
-        # Ensure typology embeddings match batch size
-        if typology_embeddings.size(0) != batch_size:
-            # Expand if single embedding for whole batch
+        # Ensure batch size matches
+        if typology_embeddings.size(0) == 1 and batch_size > 1:
             typology_embeddings = typology_embeddings.expand(batch_size, -1)
         
-        # Pass through base model embeddings
-        embedding_output = self.base_model.embeddings(input_ids)
+        # Prepare attention mask
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
         
-        # Pass through each transformer layer with TADR
-        hidden_states = embedding_output
+        extended_attention_mask = self.base_model.get_extended_attention_mask(
+            attention_mask, input_ids.size(), device=self.device
+        )
+        
+        # Get embeddings
+        hidden_states = self.base_model.embeddings(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids
+        )
+        
+        all_hidden_states = [hidden_states]
         routing_info_list = []
         
-        for layer_idx, tadr_layer in zip(self.layer_indices, self.tadr_layers):
-            hidden_states, routing_info = tadr_layer(
-                hidden_states=hidden_states,
-                typology_embedding=typology_embeddings,
-                attention_mask=attention_mask,
-                return_routing_info=return_routing_info
-            )
+        # Pass through transformer layers with TADR
+        encoder_layers = self.base_model_wrapper.encoder_layers
+        tadr_idx = 0
+        
+        for layer_idx, layer_module in enumerate(encoder_layers):
+            if layer_idx in self.adapter_layer_indices:
+                # Use TADR layer
+                hidden_states, routing_info = self.tadr_layers[tadr_idx](
+                    hidden_states=hidden_states,
+                    typology_embedding=typology_embeddings,
+                    attention_mask=attention_mask,
+                    return_routing_info=return_routing_info
+                )
+                
+                if return_routing_info:
+                    routing_info['layer_idx'] = layer_idx
+                    routing_info_list.append(routing_info)
+                
+                tadr_idx += 1
+            else:
+                # Use standard transformer layer
+                layer_outputs = layer_module(
+                    hidden_states,
+                    attention_mask=extended_attention_mask
+                )
+                hidden_states = layer_outputs[0]
             
-            if return_routing_info:
-                routing_info['layer_idx'] = layer_idx
-                routing_info_list.append(routing_info)
+            all_hidden_states.append(hidden_states)
         
-        # Extract CLS token
-        cls_embedding = hidden_states[:, 0, :]
+        # Pooler
+        pooler_output = None
+        if hasattr(self.base_model, 'pooler') and self.base_model.pooler is not None:
+            pooler_output = self.base_model.pooler(hidden_states)
+        else:
+            pooler_output = hidden_states[:, 0]
         
-        # Classification (if applicable)
+        # Classification
         logits = None
         if self.classifier is not None:
-            logits = self.classifier(cls_embedding)
+            logits = self.classifier(pooler_output)
         
-        # Prepare output
-        output = {
-            'hidden_states': hidden_states,
-            'cls_embedding': cls_embedding
+        # Prepare outputs
+        outputs = {
+            'last_hidden_state': hidden_states,
+            'pooler_output': pooler_output,
+            'hidden_states': tuple(all_hidden_states)
         }
         
         if logits is not None:
-            output['logits'] = logits
+            outputs['logits'] = logits
         
         if return_routing_info:
-            output['routing_info'] = routing_info_list
+            outputs['routing_info'] = routing_info_list
         
-        return output
-    
-    def get_total_params(self) -> int:
-        """Get total number of parameters."""
-        return sum(p.numel() for p in self.parameters())
-    
-    def get_trainable_params(self) -> int:
-        """Get number of trainable parameters."""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
-    def get_adapter_params(self) -> int:
-        """Get number of adapter parameters."""
-        adapter_params = 0
-        for tadr_layer in self.tadr_layers:
-            adapter_params += sum(
-                p.numel() for p in tadr_layer.multi_adapter.parameters()
-            )
-        return adapter_params
-    
-    def get_router_params(self) -> int:
-        """Get number of router parameters."""
-        router_params = 0
-        for tadr_layer in self.tadr_layers:
-            router_params += sum(
-                p.numel() for p in tadr_layer.router.parameters()
-            )
-        return router_params
+        return outputs
     
     def analyze_routing(
         self,
+        lang_ids: List[str],
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        language_ids: Optional[List[str]] = None
+        attention_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
         """
         Analyze routing patterns for given input.
         
-        Returns detailed routing information across all layers.
+        Args:
+            lang_ids: List of language codes
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+        
+        Returns:
+            Dictionary with routing analysis across all layers
         """
         with torch.no_grad():
-            output = self.forward(
+            outputs = self.forward(
+                lang_ids=lang_ids,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                language_ids=language_ids,
                 return_routing_info=True
             )
         
-        routing_info = output['routing_info']
+        routing_info = outputs['routing_info']
         
         # Aggregate statistics
         analysis = {
             'per_layer': routing_info,
-            'avg_entropy': torch.stack([info['entropy'] for info in routing_info]).mean(),
-            'avg_sparsity': torch.stack([info['sparsity'] for info in routing_info]).mean(),
-            'most_used_adapters': {}
+            'avg_entropy': torch.stack([info['entropy'] for info in routing_info]).mean().item(),
+            'avg_sparsity': torch.stack([info['sparsity'] for info in routing_info]).mean().item(),
+            'adapter_usage': {}
         }
         
-        # Count adapter usage across layers
+        # Count adapter usage across all layers
         adapter_counts = {}
         for info in routing_info:
-            for adapter_idx in info['top_adapter'].tolist():
+            for adapter_idx in info['top_adapter'].cpu().tolist():
                 adapter_counts[adapter_idx] = adapter_counts.get(adapter_idx, 0) + 1
         
-        analysis['most_used_adapters'] = adapter_counts
+        analysis['adapter_usage'] = adapter_counts
         
         return analysis
     
-    def print_model_summary(self):
-        """Print detailed model summary."""
-        print("\n" + "="*70)
-        print("TADR MODEL SUMMARY")
-        print("="*70)
+    def get_routing_weights(
+        self,
+        lang_ids: List[str],
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> List[torch.Tensor]:
+        """
+        Get routing weights for all TADR layers.
         
-        print(f"\n📊 Architecture:")
-        print(f"  Base Model: {self.base_model.config.model_type}")
-        print(f"  Hidden Size: {self.hidden_size}")
-        print(f"  Total Layers: {self.num_layers}")
-        print(f"  TADR Layers: {len(self.layer_indices)} {self.layer_indices}")
+        Returns:
+            List of routing weight tensors, one per TADR layer
+        """
+        with torch.no_grad():
+            outputs = self.forward(
+                lang_ids=lang_ids,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_routing_info=True
+            )
         
-        print(f"\n🔢 Parameters:")
-        total = self.get_total_params()
-        trainable = self.get_trainable_params()
-        adapters = self.get_adapter_params()
-        routers = self.get_router_params()
-        
-        print(f"  Total: {total:,}")
-        print(f"  Trainable: {trainable:,} ({trainable/total*100:.2f}%)")
-        print(f"  ├─ Adapters: {adapters:,} ({adapters/trainable*100:.1f}% of trainable)")
-        print(f"  ├─ Routers: {routers:,} ({routers/trainable*100:.1f}% of trainable)")
-        print(f"  └─ Classifier: {trainable-adapters-routers:,}")
-        
-        print(f"\n🎯 Efficiency:")
-        print(f"  Frozen: {total-trainable:,} ({(total-trainable)/total*100:.2f}%)")
-        print(f"  Parameter Efficiency: {trainable/total*100:.3f}% trainable")
-        
-        if self.classifier is not None:
-            print(f"\n📝 Task:")
-            print(f"  Type: Classification")
-            print(f"  Classes: {self.num_classes}")
-        
-        print("="*70 + "\n")
+        return [info['weights'] for info in outputs['routing_info']]
 
 
 # ============================================================================
@@ -416,252 +522,88 @@ class TADRModel(nn.Module):
 # ============================================================================
 
 def create_tadr_model(
-    base_model_name: str = "xlm-roberta-base",
-    typology_feature_file: str = "typology_features.csv",
+    model_name: str = DEFAULT_MODEL_NAME,
+    feature_file: str = 'wals_features.csv',
     num_adapters: int = 10,
     adapter_bottleneck: int = 64,
     num_classes: Optional[int] = None,
     gating_type: str = "softmax",
+    num_adapter_layers: int = 6,
     device: Optional[str] = None
-) -> TADRModel:
+) -> CompleteTADRModel:
     """
-    Convenience function to create TADR model.
+    Convenience function to create a complete TADR model with sensible defaults.
     
     Args:
-        base_model_name: HuggingFace model name
-        typology_feature_file: Path to typology features
-        num_adapters: Number of language-specific adapters
+        model_name: HuggingFace model identifier
+        feature_file: Path to typological features CSV
+        num_adapters: Number of adapters per layer
         adapter_bottleneck: Bottleneck dimension for adapters
-        num_classes: Number of output classes
-        gating_type: Routing gating type ("softmax", "topk", "threshold")
+        num_classes: Number of output classes (None for feature extraction)
+        gating_type: Routing gating type ('softmax', 'topk', 'threshold')
+        num_adapter_layers: Number of layers to add adapters to
         device: Device to use
     
     Returns:
-        Initialized TADR model
+        Initialized CompleteTADRModel
     """
-    from step1_typology_module import TypologicalFeatureLoader, TypologyFeatureModule
-    from step2_base_model import BaseModelWrapper
+    gating_config = {}
+    if gating_type == "topk":
+        gating_config = {"k": 3, "temperature": 1.0}
+    elif gating_type == "threshold":
+        gating_config = {"threshold": 0.1, "temperature": 1.0}
     
-    # Load typology module
-    feature_loader = TypologicalFeatureLoader(typology_feature_file)
-    typology_module = TypologyFeatureModule(
-        feature_loader=feature_loader,
-        embedding_dim=128,
-        hidden_dim=256
-    )
-    
-    # Load base model
-    base_model = BaseModelWrapper(
-        model_name=base_model_name,
-        freeze_base=True,
+    model = CompleteTADRModel(
+        model_name=model_name,
+        feature_file=feature_file,
+        num_adapters=num_adapters,
+        adapter_bottleneck_size=adapter_bottleneck,
+        gating_type=gating_type,
+        gating_config=gating_config,
+        num_adapter_layers=num_adapter_layers,
+        num_classes=num_classes,
         device=device
     )
     
-    # Adapter configuration
-    adapter_config = {
-        'num_adapters': num_adapters,
-        'bottleneck_size': adapter_bottleneck,
-        'non_linearity': 'relu',
-        'dropout': 0.1
-    }
-    
-    # Router configuration
-    router_config = {
-        'hidden_dims': [256, 128],
-        'dropout': 0.1,
-        'gating_type': gating_type,
-        'gating_config': {'k': 2} if gating_type == 'topk' else {},
-        'pooling_type': 'cls'
-    }
-    
-    # Create TADR model
-    tadr_model = TADRModel(
-        base_model=base_model.model,
-        typology_module=typology_module,
-        adapter_config=adapter_config,
-        router_config=router_config,
-        num_classes=num_classes,
-        layer_indices=list(range(6, 12))  # Last 6 layers
-    )
-    
-    return tadr_model
+    return model
 
 
 # ============================================================================
-# TESTING AND EXAMPLES
+# MAIN
 # ============================================================================
-
-def test_tadr_integration():
-    """Test TADR model integration."""
-    print("="*70)
-    print("Testing TADR Model Integration")
-    print("="*70)
-    
-    # Note: This test requires all previous modules to be imported
-    # For demonstration, we'll show the structure
-    
-    print("\n✅ TADR Integration Structure:")
-    print("""
-    TADRModel:
-      ├── Base Model (Frozen)
-      │   └── XLM-R / mBERT
-      ├── Typology Module
-      │   └── Feature Loader + Embedding Network
-      └── TADR Layers (Per transformer layer)
-          ├── Context Extractor
-          ├── Dynamic Router
-          │   ├── Router MLP
-          │   └── Gating Mechanism
-          └── Multi-Adapter Module
-              └── K Language-Specific Adapters
-    """)
-    
-    print("\n📊 Forward Pass Flow:")
-    print("""
-    1. Input → Base Model Embeddings
-    2. For each TADR layer:
-       a. Extract context from hidden states
-       b. Get typology embedding for language
-       c. Router: (typology + context) → weights
-       d. Apply weighted adapters
-       e. Continue to next layer
-    3. Extract CLS token
-    4. Classification head (if applicable)
-    """)
-    
-    print("\n🎯 Key Features:")
-    print("  ✓ Parameter-efficient: ~5-6% trainable parameters")
-    print("  ✓ Dynamic routing based on typology + context")
-    print("  ✓ Multiple gating strategies (softmax, top-k, threshold)")
-    print("  ✓ Flexible architecture (choose which layers get adapters)")
-    print("  ✓ Analysis tools for routing patterns")
-    
-    print("\n✅ Integration test structure complete!")
-
-
-def demo_usage_example():
-    """Demonstrate how to use TADR model."""
-    print("\n" + "="*70)
-    print("TADR Model Usage Example")
-    print("="*70)
-    
-    print("""
-# 1. Initialize TADR model
-tadr_model = create_tadr_model(
-    base_model_name="xlm-roberta-base",
-    typology_feature_file="typology_features.csv",
-    num_adapters=10,
-    adapter_bottleneck=64,
-    num_classes=3,  # For classification
-    gating_type="topk"
-)
-
-# 2. Prepare input
-texts = ["Hello world", "नमस्ते दुनिया", "你好世界"]
-language_ids = ["en", "hi", "zh"]
-
-tokenizer = tadr_model.base_model.tokenizer
-encoded = tokenizer(texts, padding=True, return_tensors="pt")
-
-# 3. Forward pass
-output = tadr_model(
-    input_ids=encoded['input_ids'],
-    attention_mask=encoded['attention_mask'],
-    language_ids=language_ids
-)
-
-# 4. Get predictions
-logits = output['logits']
-predictions = logits.argmax(dim=-1)
-
-# 5. Analyze routing
-routing_analysis = tadr_model.analyze_routing(
-    input_ids=encoded['input_ids'],
-    attention_mask=encoded['attention_mask'],
-    language_ids=language_ids
-)
-
-print("Routing entropy:", routing_analysis['avg_entropy'])
-print("Most used adapters:", routing_analysis['most_used_adapters'])
-    """)
-    
-    print("\n✅ Usage example complete!")
-
-
-def demo_training_setup():
-    """Demonstrate training setup."""
-    print("\n" + "="*70)
-    print("Training Setup Example")
-    print("="*70)
-    
-    print("""
-# 1. Create model
-model = create_tadr_model(...)
-model.print_model_summary()
-
-# 2. Setup optimizer (only trainable params)
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=1e-4,
-    weight_decay=0.01
-)
-
-# 3. Training loop
-for batch in dataloader:
-    # Forward pass
-    output = model(
-        input_ids=batch['input_ids'],
-        attention_mask=batch['attention_mask'],
-        language_ids=batch['language_ids']
-    )
-    
-    # Compute loss
-    task_loss = F.cross_entropy(output['logits'], batch['labels'])
-    
-    # Optional: Add load balancing loss
-    routing_weights = [layer.last_routing_weights 
-                       for layer in model.tadr_layers]
-    lb_loss = compute_load_balancing_loss(routing_weights)
-    
-    total_loss = task_loss + 0.01 * lb_loss
-    
-    # Backward pass
-    optimizer.zero_grad()
-    total_loss.backward()
-    optimizer.step()
-
-# 4. Zero-shot transfer to new language
-new_lang_id = "sw"  # Swahili (unseen)
-output = model(
-    input_ids=test_input,
-    language_ids=[new_lang_id] * batch_size
-)
-# Model routes based on Swahili's typology!
-    """)
-    
-    print("\n✅ Training setup example complete!")
-
 
 if __name__ == "__main__":
-    print("\n" + "🚀" * 35)
-    print("TADR Framework - Step 5: Integration Layer")
-    print("🚀" * 35)
+    from wals_preprocessor import prepare_wals_data
     
-    # Run tests
-    test_tadr_integration()
-    demo_usage_example()
-    demo_training_setup()
+    print("\n" + "🚀"*35)
+    print("TADR Framework - Step 5: Integration Layer")
+    print("🚀"*35 + "\n")
+    
+    # Prepare WALS data if needed
+    try:
+        prepare_wals_data("cldf-datasets-wals-0f5cd82", "wals_features.csv")
+    except:
+        print("WALS data already prepared.\n")
+    
+    # Create complete TADR model
+    model = create_tadr_model(
+        model_name=DEFAULT_MODEL_NAME,
+        feature_file='wals_features.csv',
+        num_adapters=10,
+        adapter_bottleneck=64,
+        num_classes=3,  # Example: 3-way classification
+        gating_type="softmax",
+        num_adapter_layers=6  # Last 6 layers
+    )
+    
+    print("✅ Complete TADR Model successfully initialized!")
+    print("\nModel is ready for training or inference.")
+    print("\nKey features:")
+    print("  ✓ Context-aware dynamic routing (typology + context)")
+    print("  ✓ Parameter-efficient adaptation")
+    print("  ✓ Multiple gating strategies")
+    print("  ✓ Built-in routing analysis tools")
     
     print("\n" + "="*70)
-    print("✅ Step 5 Complete!")
-    print("="*70)
-    print("\nComplete TADR Framework:")
-    print("  ✅ Step 1: Typology Module")
-    print("  ✅ Step 2: Base Model Setup")
-    print("  ✅ Step 3: Adapter Modules")
-    print("  ✅ Step 4: Dynamic Routing Network")
-    print("  ✅ Step 5: Integration Layer")
-    print("\nNext steps:")
-    print("  → Step 6: Training Pipeline")
-    print("  → Step 7: Evaluation & Analysis")
+    print("Complete TADR Framework assembled!")
     print("="*70 + "\n")
