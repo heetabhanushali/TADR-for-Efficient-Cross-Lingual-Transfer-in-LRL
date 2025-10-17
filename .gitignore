@@ -1,0 +1,47 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+env/
+venv/
+.venv/
+
+cldf-datasets-wals-0f5cd82/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Logs
+*.log
+
+# Data files
+*.csv
+*.json
+*.zip
+*.tar.gz
+*.h5
+data/
+wals_features_processed.csv
+sample_typology_features.csv
+
+# Model checkpoints / saved models
+*.pt
+*.pth
+checkpoints/
+models/
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# MacOS
+.DS_Store
+
+# Misc
+*.tmp
+*.bak
