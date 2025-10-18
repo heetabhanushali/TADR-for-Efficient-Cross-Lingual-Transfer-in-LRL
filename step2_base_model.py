@@ -183,6 +183,72 @@ class BaseModelWrapper(nn.Module):
         """
         outputs = self.forward(input_ids, attention_mask)
         return outputs.hidden_states[layer_idx]
+    
+    def unfreeze_base_model(self):
+        """Unfreeze all parameters in the base model."""
+        print("Unfreezing base model parameters...")
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+    # ============================================================================
+    # ADD THESE 3 NEW METHODS BELOW
+    # ============================================================================
+
+    def unfreeze_last_n_layers(self, n: int = 4):
+        """
+        Unfreeze the last N transformer layers.
+        """
+        print(f"Unfreezing last {n} transformer layers...")
+        unfrozen = 0
+        layers_to_unfreeze = list(range(max(0, self.num_layers - n), self.num_layers))
+
+        for layer_idx in layers_to_unfreeze:
+            for param in self.encoder_layers[layer_idx].parameters():
+                param.requires_grad = True
+                unfrozen += param.numel()
+        
+        print(f"  Unfroze layers {layers_to_unfreeze}: {unfrozen:,} parameters")
+        return unfrozen
+
+    def unfreeze_embeddings(self):
+        print("Unfreezing embeddings...")
+        unfrozen = 0
+        
+        if hasattr(self.model, 'embeddings'):
+            for param in self.model.embeddings.parameters():
+                param.requires_grad = True
+                unfrozen += param.numel()
+        
+        print(f"  Unfroze {unfrozen:,} embedding parameters")
+        return unfrozen
+
+    def get_unfreezing_strategy(self, strategy: str = 'efficient'):
+        # First freeze everything
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        unfrozen_total = 0
+        
+        if strategy == 'minimal':
+            print("\nApplying 'minimal' unfreezing: Only adapters + classifier")
+            # Nothing to unfreeze in base model
+            return 0        
+        elif strategy == 'efficient':
+            print("\nApplying 'efficient' unfreezing: Embeddings + last 6 layers")
+            unfrozen_total += self.unfreeze_embeddings()
+            unfrozen_total += self.unfreeze_last_n_layers(4)        
+        elif strategy == 'aggressive':
+            print("\nApplying 'aggressive' unfreezing: Embeddings + last 9 layers")
+            unfrozen_total += self.unfreeze_embeddings()
+            unfrozen_total += self.unfreeze_last_n_layers(6)        
+        elif strategy == 'full':
+            print("\nApplying 'full' unfreezing: All base model parameters")
+            self.unfreeze_base_model()
+            unfrozen_total = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        else:
+            raise ValueError(f"Unknown strategy '{strategy}'. Choose from: 'minimal', 'efficient', 'aggressive', 'full'")
+        
+        return unfrozen_total
 
 
 class ModelWithAdapterSlots(BaseModelWrapper):

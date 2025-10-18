@@ -63,6 +63,7 @@ class TADRLayer(nn.Module):
         hidden_states: torch.Tensor,
         typology_embedding: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        extended_attention_mask: Optional[torch.Tensor] = None,
         return_routing_info: bool = False
     ) -> Tuple[torch.Tensor, Optional[Dict]]:
         """
@@ -92,7 +93,7 @@ class TADRLayer(nn.Module):
         # Pass through original transformer layer
         layer_output = self.transformer_layer(
             hidden_states, 
-            attention_mask=attention_mask
+            attention_mask = extended_attention_mask
         )[0]
         
         # Apply routed adapters (standard placement: after FFN)
@@ -157,27 +158,9 @@ class CompleteTADRModel(nn.Module):
         # General config
         num_adapter_layers: Optional[int] = None,
         num_classes: Optional[int] = None,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        unfreezing_strategy: str = "full",
     ):
-        """
-        Args:
-            model_name: HuggingFace model identifier
-            feature_file: Path to typological features CSV
-            typology_embedding_dim: Dimension of typology embeddings
-            typology_hidden_dim: Hidden dimension for typology MLP
-            num_adapters: Number of adapters per layer
-            adapter_bottleneck_size: Bottleneck dimension for adapters
-            adapter_non_linearity: Activation function for adapters
-            adapter_dropout: Dropout for adapters
-            router_hidden_dims: Hidden dimensions for router MLP
-            router_dropout: Dropout for router
-            gating_type: Type of gating mechanism
-            gating_config: Configuration for gating
-            pooling_type: Context pooling strategy
-            num_adapter_layers: Number of layers to add adapters to
-            num_classes: Number of output classes (for classification)
-            device: Device to use
-        """
         super().__init__()
         
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -250,9 +233,7 @@ class CompleteTADRModel(nn.Module):
             )
             
             # Get transformer layer
-            transformer_layer = self.base_model_wrapper.encoder_layers[
-                self.adapter_layer_indices.index(layer_idx)
-            ]
+            transformer_layer = self.base_model_wrapper.encoder_layers[layer_idx]
             
             # Create TADR layer
             tadr_layer = TADRLayer(
@@ -270,15 +251,40 @@ class CompleteTADRModel(nn.Module):
         # ========================
         self.num_classes = num_classes
         if num_classes is not None:
-            self.classifier = nn.Linear(self.hidden_size, num_classes)
+            self.classifier = nn.Sequential(
+                nn.Linear(self.hidden_size, 256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, num_classes)
+            )
+            for module in self.classifier.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=1.0)
+                    nn.init.zeros_(module.bias)
         else:
             self.classifier = None
+
+        # ========================
+        # Apply unfreezing strategy
+        # ========================
+        if unfreezing_strategy != 'minimal':
+            self.base_model_wrapper.get_unfreezing_strategy(unfreezing_strategy)
         
         # Move to device
         self.to(self.device)
         
         # Print summary
         self._print_summary()
+    
+    def apply_unfreezing_strategy(self, strategy: str):
+        self.base_model_wrapper.get_unfreezing_strategy(strategy)
+        # Print updated parameter count
+        trainable = self.count_trainable_parameters()
+        total = self.count_parameters()
+        print(f"\n📊 Updated trainable parameters:")
+        print(f"  Total: {total:,}")
+        print(f"  Trainable: {trainable:,} ({trainable/total*100:.2f}%)")
+
     
     def _print_summary(self):
         """Print model configuration summary."""
@@ -401,10 +407,11 @@ class CompleteTADRModel(nn.Module):
             if layer_idx in self.adapter_layer_indices:
                 # Use TADR layer
                 hidden_states, routing_info = self.tadr_layers[tadr_idx](
-                    hidden_states=hidden_states,
-                    typology_embedding=typology_embeddings,
-                    attention_mask=attention_mask,
-                    return_routing_info=return_routing_info
+                    hidden_states = hidden_states,
+                    typology_embedding = typology_embeddings,
+                    attention_mask = attention_mask,
+                    extended_attention_mask = extended_attention_mask,
+                    return_routing_info = return_routing_info
                 )
                 
                 if return_routing_info:
@@ -524,29 +531,15 @@ class CompleteTADRModel(nn.Module):
 def create_tadr_model(
     model_name: str = DEFAULT_MODEL_NAME,
     feature_file: str = 'wals_features.csv',
-    num_adapters: int = 10,
-    adapter_bottleneck: int = 64,
+    num_adapters: int = 8,
+    adapter_bottleneck: int = 38,
     num_classes: Optional[int] = None,
     gating_type: str = "softmax",
-    num_adapter_layers: int = 6,
-    device: Optional[str] = None
+    num_adapter_layers: int = 4,
+    device: Optional[str] = None,
+    unfreezing_strategy: str = "full",
 ) -> CompleteTADRModel:
-    """
-    Convenience function to create a complete TADR model with sensible defaults.
-    
-    Args:
-        model_name: HuggingFace model identifier
-        feature_file: Path to typological features CSV
-        num_adapters: Number of adapters per layer
-        adapter_bottleneck: Bottleneck dimension for adapters
-        num_classes: Number of output classes (None for feature extraction)
-        gating_type: Routing gating type ('softmax', 'topk', 'threshold')
-        num_adapter_layers: Number of layers to add adapters to
-        device: Device to use
-    
-    Returns:
-        Initialized CompleteTADRModel
-    """
+
     gating_config = {}
     if gating_type == "topk":
         gating_config = {"k": 3, "temperature": 1.0}
@@ -589,11 +582,11 @@ if __name__ == "__main__":
     model = create_tadr_model(
         model_name=DEFAULT_MODEL_NAME,
         feature_file='wals_features.csv',
-        num_adapters=10,
-        adapter_bottleneck=64,
+        num_adapters=8,
+        adapter_bottleneck=48,
         num_classes=3,  # Example: 3-way classification
         gating_type="softmax",
-        num_adapter_layers=6  # Last 6 layers
+        num_adapter_layers=4  # Last 6 layers
     )
     
     print("✅ Complete TADR Model successfully initialized!")

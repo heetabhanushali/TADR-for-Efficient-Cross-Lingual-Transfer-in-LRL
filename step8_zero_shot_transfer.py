@@ -15,11 +15,12 @@ import os
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pickle
 
 # Import previous components
-# from step1_typology_module import TypologyFeatureModule
-# from step5_integration import TADRModel
-# from step7_training_loop import MultilingualDataset, collate_fn
+from step5_integration import CompleteTADRModel, create_tadr_model
+from step7_training_loop import MultilingualDataset, collate_fn, load_preprocessed_data
+from transformers import AutoTokenizer
 
 
 class ZeroShotEvaluator:
@@ -31,7 +32,6 @@ class ZeroShotEvaluator:
     def __init__(
         self,
         model: nn.Module,
-        typology_module: nn.Module,
         tokenizer,
         device: str = 'cuda',
         output_dir: str = './zero_shot_results'
@@ -45,12 +45,15 @@ class ZeroShotEvaluator:
             output_dir: Directory to save results
         """
         self.model = model.to(device)
-        self.typology_module = typology_module
+        self.typology_module = model.typology_module
         self.tokenizer = tokenizer
         self.device = device
         self.output_dir = output_dir
         
         os.makedirs(output_dir, exist_ok=True)
+
+        print(f"✅ ZeroShotEvaluator initialized")
+        print(f"   Output directory: {output_dir}")
         
         self.model.eval()
     

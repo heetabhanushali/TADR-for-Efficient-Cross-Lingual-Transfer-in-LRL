@@ -1,14 +1,13 @@
 """
 TADR Framework - Step 7: Training Loop
-Complete training pipeline for TADR model
+Complete training pipeline for TADR model with zero-shot evaluation
 """
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
-from transformers import AutoTokenizer
+from transformers import get_linear_schedule_with_warmup, AutoTokenizer
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 from tqdm import tqdm
@@ -16,18 +15,22 @@ import json
 import os
 from collections import defaultdict
 import time
+import pickle
 
 # Import previous components
-# from step1_typology_module import TypologyFeatureModule
-# from step5_integration import TADRModel
-# from step6_loss_functions import TADRLoss
+from step5_integration import CompleteTADRModel, create_tadr_model
+from step6_loss_functions import TADRLoss
 
+tqdm.disable = True
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ============================================================================
+# DATASET
+# ============================================================================
 
 class MultilingualDataset(Dataset):
-    """
-    Dataset for multilingual text classification/sequence labeling.
-    Handles multiple languages with language ID tracking.
-    """
+    """Dataset for multilingual text classification."""
     
     def __init__(
         self,
@@ -37,14 +40,6 @@ class MultilingualDataset(Dataset):
         tokenizer,
         max_length: int = 128
     ):
-        """
-        Args:
-            texts: List of text samples
-            labels: List of labels
-            language_ids: List of language IDs (e.g., ['en', 'hi', 'zh'])
-            tokenizer: HuggingFace tokenizer
-            max_length: Maximum sequence length
-        """
         self.texts = texts
         self.labels = labels
         self.language_ids = language_ids
@@ -62,7 +57,6 @@ class MultilingualDataset(Dataset):
         label = self.labels[idx]
         lang_id = self.language_ids[idx]
         
-        # Tokenize
         encoding = self.tokenizer(
             text,
             max_length=self.max_length,
@@ -89,11 +83,12 @@ def collate_fn(batch):
     }
 
 
+# ============================================================================
+# TRAINER
+# ============================================================================
+
 class TADRTrainer:
-    """
-    Trainer class for TADR model.
-    Handles training loop, validation, and checkpointing.
-    """
+    """Trainer class for TADR model."""
     
     def __init__(
         self,
@@ -109,24 +104,9 @@ class TADRTrainer:
         save_steps: int = 500,
         eval_steps: int = 500,
         max_grad_norm: float = 1.0,
-        accumulation_steps: int = 1
+        accumulation_steps: int = 1,
+        verbose: bool = True
     ):
-        """
-        Args:
-            model: TADR model
-            train_dataloader: Training data loader
-            val_dataloader: Validation data loader
-            optimizer: Optimizer
-            scheduler: Learning rate scheduler
-            loss_fn: Loss function
-            device: Device to use
-            output_dir: Directory for checkpoints
-            logging_steps: Log every N steps
-            save_steps: Save checkpoint every N steps
-            eval_steps: Evaluate every N steps
-            max_grad_norm: Gradient clipping threshold
-            accumulation_steps: Gradient accumulation steps
-        """
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
@@ -137,25 +117,22 @@ class TADRTrainer:
         self.eval_steps = eval_steps
         self.max_grad_norm = max_grad_norm
         self.accumulation_steps = accumulation_steps
+        self.verbose = verbose
         
-        # Setup optimizer if not provided
         if optimizer is None:
             self.optimizer = self._create_optimizer()
         else:
             self.optimizer = optimizer
         
-        # Setup scheduler if not provided
         if scheduler is None and train_dataloader is not None:
             self.scheduler = self._create_scheduler(len(train_dataloader))
         else:
             self.scheduler = scheduler
         
-        # Setup loss function if not provided
         if loss_fn is None:
-            from step6_loss_functions import TADRLoss
             self.loss_fn = TADRLoss(
                 task_type="classification",
-                num_classes=3,  # Default
+                num_classes=3,
                 num_adapters=10,
                 use_load_balancing=True,
                 load_balancing_weight=0.01
@@ -163,39 +140,42 @@ class TADRTrainer:
         else:
             self.loss_fn = loss_fn
         
-        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Training state
         self.global_step = 0
         self.epoch = 0
         self.best_val_loss = float('inf')
+        self.best_val_acc = 0.0
         
-        # Logging
         self.train_losses = []
         self.val_losses = []
-        self.routing_stats = []
+        self.val_accuracies = []
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_acc': [],
+            'val_acc_per_lang': []
+        }
     
-    def _create_optimizer(self) -> torch.optim.Optimizer:
-        """Create optimizer for trainable parameters only."""
-        # Only optimize adapter and router parameters
+    def _create_optimizer(self , lr:float = 1e-4) -> torch.optim.Optimizer:
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
         optimizer = AdamW(
             trainable_params,
-            lr=1e-4,
+            lr = lr,
             weight_decay=0.01,
             betas=(0.9, 0.999),
             eps=1e-8
         )
         
-        print(f"Optimizer created with {len(trainable_params)} parameter groups")
+        if self.verbose:
+            num_params = sum(p.numel() for p in trainable_params)
+            print(f"Optimizer: {num_params:,} trainable parameters , LR={lr}")
         return optimizer
     
     def _create_scheduler(self, steps_per_epoch: int, num_epochs: int = 10):
-        """Create learning rate scheduler."""
         num_training_steps = steps_per_epoch * num_epochs
-        num_warmup_steps = int(0.1 * num_training_steps)  # 10% warmup
+        num_warmup_steps = int(0.1 * num_training_steps)
         
         scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
@@ -203,7 +183,8 @@ class TADRTrainer:
             num_training_steps=num_training_steps
         )
         
-        print(f"Scheduler created: {num_training_steps} steps, {num_warmup_steps} warmup")
+        if self.verbose:
+            print(f"Scheduler: {num_training_steps} steps, {num_warmup_steps} warmup")
         return scheduler
     
     def train_epoch(self) -> Dict[str, float]:
@@ -214,54 +195,50 @@ class TADRTrainer:
         task_loss_sum = 0
         lb_loss_sum = 0
         num_batches = 0
+        correct = 0
+        total_samples = 0
         
-        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}")
+        progress_bar = tqdm(
+            self.train_dataloader, 
+            desc=f"Epoch {self.epoch + 1}/{self.epoch + 1}",
+            disable=not self.verbose
+        )
         
         for batch_idx, batch in enumerate(progress_bar):
-            # Move batch to device
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             language_ids = batch['language_ids']
             
-            # Forward pass
             outputs = self.model(
+                lang_ids=language_ids,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                language_ids=language_ids,
                 return_routing_info=True
             )
             
-            # Get routing weights from all layers
-            routing_weights = [info['weights'] for info in outputs.get('routing_info', [])]
+            routing_weights = None
+            if 'routing_info' in outputs and outputs['routing_info']:
+                routing_weights = [info['weights'] for info in outputs['routing_info']]
             
-            # Compute loss
             loss_dict = self.loss_fn(
                 logits=outputs['logits'],
                 labels=labels,
                 routing_weights=routing_weights,
-                typology_embeddings=None,  # Already embedded
                 attention_mask=attention_mask,
                 return_components=True
             )
             
             loss = loss_dict['total']
-            
-            # Scale loss for gradient accumulation
             loss = loss / self.accumulation_steps
-            
-            # Backward pass
             loss.backward()
             
-            # Gradient accumulation
             if (batch_idx + 1) % self.accumulation_steps == 0:
-                # Clip gradients
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.max_grad_norm
                 )
                 
-                # Optimizer step
                 self.optimizer.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
@@ -269,7 +246,10 @@ class TADRTrainer:
                 
                 self.global_step += 1
             
-            # Logging
+            preds = outputs['logits'].argmax(dim=-1)
+            correct += (preds == labels).sum().item()
+            total_samples += labels.size(0)
+            
             total_loss += loss.item() * self.accumulation_steps
             if 'task' in loss_dict:
                 task_loss_sum += loss_dict['task'].item()
@@ -277,42 +257,41 @@ class TADRTrainer:
                 lb_loss_sum += loss_dict['load_balancing'].item()
             num_batches += 1
             
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': total_loss / num_batches,
-                'lr': self.optimizer.param_groups[0]['lr']
-            })
+            if self.verbose:
+                progress_bar.set_postfix({
+                    'loss': f"{total_loss / num_batches:.4f}",
+                    'acc': f"{correct / total_samples:.3f}",
+                    'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                })
             
-            # Periodic logging
-            if self.global_step % self.logging_steps == 0:
-                self._log_training_step(loss_dict)
-            
-            # Periodic evaluation
             if self.val_dataloader and self.global_step % self.eval_steps == 0:
                 val_metrics = self.evaluate()
-                self.model.train()  # Back to training mode
+                self.model.train()
                 
-                # Save best model
-                if val_metrics['loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['loss']
+                if val_metrics['accuracy'] > self.best_val_acc:
+                    self.best_val_acc = val_metrics['accuracy']
                     self.save_checkpoint('best_model.pt')
+                    if self.verbose:
+                        print(f"\n✅ New best accuracy: {self.best_val_acc:.4f}")
             
-            # Periodic saving
             if self.global_step % self.save_steps == 0:
                 self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
         
-        # Epoch metrics
         metrics = {
             'loss': total_loss / num_batches,
+            'accuracy': correct / total_samples,  # ← ADD THIS
             'task_loss': task_loss_sum / num_batches,
             'lb_loss': lb_loss_sum / num_batches if lb_loss_sum > 0 else 0
         }
         
         return metrics
     
-    def evaluate(self) -> Dict[str, float]:
-        """Evaluate on validation set."""
-        if self.val_dataloader is None:
+    def evaluate(self, dataloader: Optional[DataLoader] = None) -> Dict[str, float]:
+        """Evaluate on validation/test set."""
+        if dataloader is None:
+            dataloader = self.val_dataloader
+        
+        if dataloader is None:
             return {}
         
         self.model.eval()
@@ -320,27 +299,22 @@ class TADRTrainer:
         total_loss = 0
         correct = 0
         total = 0
-        all_preds = []
-        all_labels = []
         
-        # Language-specific metrics
         lang_metrics = defaultdict(lambda: {'correct': 0, 'total': 0})
         
         with torch.no_grad():
-            for batch in tqdm(self.val_dataloader, desc="Evaluating"):
+            for batch in dataloader:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 language_ids = batch['language_ids']
                 
-                # Forward pass
                 outputs = self.model(
+                    lang_ids=language_ids,
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    language_ids=language_ids
+                    attention_mask=attention_mask
                 )
                 
-                # Compute loss
                 loss_dict = self.loss_fn(
                     logits=outputs['logits'],
                     labels=labels,
@@ -349,25 +323,18 @@ class TADRTrainer:
                 
                 total_loss += loss_dict['total'].item()
                 
-                # Predictions
                 preds = outputs['logits'].argmax(dim=-1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)
                 
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                
-                # Per-language metrics
                 for i, lang_id in enumerate(language_ids):
                     lang_metrics[lang_id]['total'] += 1
                     if preds[i] == labels[i]:
                         lang_metrics[lang_id]['correct'] += 1
         
-        # Calculate metrics
-        avg_loss = total_loss / len(self.val_dataloader)
+        avg_loss = total_loss / len(dataloader)
         accuracy = correct / total
         
-        # Per-language accuracy
         lang_acc = {
             lang: stats['correct'] / stats['total']
             for lang, stats in lang_metrics.items()
@@ -379,91 +346,76 @@ class TADRTrainer:
             'language_accuracy': lang_acc
         }
         
-        print(f"\nValidation Metrics:")
-        print(f"  Loss: {avg_loss:.4f}")
-        print(f"  Accuracy: {accuracy:.4f}")
-        print(f"  Per-language accuracy:")
-        for lang, acc in lang_acc.items():
-            print(f"    {lang}: {acc:.4f}")
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print(f"Evaluation Results:")
+            print(f"  Loss: {avg_loss:.4f}")
+            print(f"  Accuracy: {accuracy:.4f}")
+            print(f"\n  Per-language accuracy:")
+            for lang, acc in sorted(lang_acc.items()):
+                print(f"    {lang}: {acc:.4f}")
+            print(f"{'='*70}\n")
         
         return metrics
     
     def train(self, num_epochs: int):
-        """
-        Main training loop.
-        
-        Args:
-            num_epochs: Number of epochs to train
-        """
-        print("\n" + "="*70)
-        print("Starting Training")
-        print("="*70)
-        print(f"Number of epochs: {num_epochs}")
-        print(f"Training batches per epoch: {len(self.train_dataloader)}")
-        if self.val_dataloader:
-            print(f"Validation batches: {len(self.val_dataloader)}")
-        print(f"Device: {self.device}")
-        print(f"Output directory: {self.output_dir}")
-        print("="*70 + "\n")
+        """Main training loop."""
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print("Starting Training")
+            print(f"{'='*70}")
+            print(f"Epochs: {num_epochs}")
+            print(f"Batches/epoch: {len(self.train_dataloader)}")
+            if self.val_dataloader:
+                print(f"Validation batches: {len(self.val_dataloader)}")
+            print(f"Device: {self.device}")
+            print(f"Output: {self.output_dir}")
+            print(f"{'='*70}\n")
         
         start_time = time.time()
         
         for epoch in range(num_epochs):
             self.epoch = epoch
             
-            print(f"\n{'='*70}")
-            print(f"Epoch {epoch + 1}/{num_epochs}")
-            print(f"{'='*70}")
-            
-            # Train epoch
             train_metrics = self.train_epoch()
             
-            print(f"\nTraining Metrics (Epoch {epoch + 1}):")
-            print(f"  Loss: {train_metrics['loss']:.4f}")
-            print(f"  Task Loss: {train_metrics['task_loss']:.4f}")
-            if train_metrics['lb_loss'] > 0:
-                print(f"  Load Balancing Loss: {train_metrics['lb_loss']:.6f}")
+            if self.verbose:
+                print(f"\nEpoch {epoch+1}/{num_epochs}:")
+                print(f"  Train Loss: {train_metrics['loss']:.4f}")
+                print(f"  Task Loss: {train_metrics['task_loss']:.4f}")
+                if train_metrics['lb_loss'] > 0:
+                    print(f"  LB Loss: {train_metrics['lb_loss']:.6f}")
             
-            # Evaluate
+            self.history['train_loss'].append(train_metrics['loss'])
+            
             if self.val_dataloader:
                 val_metrics = self.evaluate()
-                self.val_losses.append(val_metrics['loss'])
+                self.history['val_loss'].append(val_metrics['loss'])
+                self.history['val_acc'].append(val_metrics['accuracy'])
+                self.history['val_acc_per_lang'].append(val_metrics['language_accuracy'])
                 
-                # Save best model
-                if val_metrics['loss'] < self.best_val_loss:
+                if val_metrics['accuracy'] > self.best_val_acc:
+                    self.best_val_acc = val_metrics['accuracy']
                     self.best_val_loss = val_metrics['loss']
                     self.save_checkpoint('best_model.pt')
-                    print(f"\n✅ New best model saved! (val_loss: {val_metrics['loss']:.4f})")
+                    if self.verbose:
+                        print(f"\n✅ Best model saved! Acc: {self.best_val_acc:.4f}")
             
-            # Save checkpoint at end of epoch
-            self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pt')
-            
-            self.train_losses.append(train_metrics['loss'])
+            self.save_checkpoint(f'checkpoint_epoch_{epoch+1}.pt')
         
         total_time = time.time() - start_time
-        print("\n" + "="*70)
-        print("Training Complete!")
-        print("="*70)
-        print(f"Total time: {total_time/60:.2f} minutes")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
-        print(f"Final model saved to: {self.output_dir}")
-        print("="*70 + "\n")
         
-        # Save training history
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print("Training Complete!")
+            print(f"{'='*70}")
+            print(f"Time: {total_time/60:.2f} minutes")
+            print(f"Best validation accuracy: {self.best_val_acc:.4f}")
+            print(f"Best validation loss: {self.best_val_loss:.4f}")
+            print(f"Model saved to: {self.output_dir}")
+            print(f"{'='*70}\n")
+        
         self.save_training_history()
-    
-    def _log_training_step(self, loss_dict: Dict[str, torch.Tensor]):
-        """Log training step information."""
-        log_str = f"Step {self.global_step} | "
-        for name, value in loss_dict.items():
-            if isinstance(value, torch.Tensor):
-                log_str += f"{name}: {value.item():.4f} | "
-        
-        # Get current learning rate
-        lr = self.optimizer.param_groups[0]['lr']
-        log_str += f"lr: {lr:.2e}"
-        
-        print(log_str)
     
     def save_checkpoint(self, filename: str):
         """Save model checkpoint."""
@@ -476,12 +428,14 @@ class TADRTrainer:
             'epoch': self.epoch,
             'global_step': self.global_step,
             'best_val_loss': self.best_val_loss,
+            'best_val_acc': self.best_val_acc,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses
         }
         
         torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path}")
+        if self.verbose:
+            print(f"Checkpoint saved: {checkpoint_path}")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
@@ -496,75 +450,95 @@ class TADRTrainer:
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
-        self.train_losses = checkpoint.get('train_losses', [])
-        self.val_losses = checkpoint.get('val_losses', [])
+        self.best_val_acc = checkpoint.get('best_val_acc', 0.0)
         
-        print(f"Checkpoint loaded: {checkpoint_path}")
-        print(f"  Epoch: {self.epoch}")
-        print(f"  Global step: {self.global_step}")
-        print(f"  Best val loss: {self.best_val_loss:.4f}")
+        if self.verbose:
+            print(f"Checkpoint loaded from {checkpoint_path}")
     
     def save_training_history(self):
         """Save training history to JSON."""
         history = {
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
+            'train_loss': self.history['train_loss'],
+            'val_loss': self.history['val_loss'],
+            'val_acc': self.history['val_acc'],
+            'val_acc_per_lang': self.history['val_acc_per_lang'],
             'best_val_loss': self.best_val_loss,
+            'best_val_acc': self.best_val_acc,
             'total_epochs': self.epoch + 1,
             'total_steps': self.global_step
         }
         
         history_path = os.path.join(self.output_dir, 'training_history.json')
+        
+        # Convert numpy types to native Python types for JSON serialization
+        def convert_to_serializable(obj):
+            if isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_serializable(item) for item in obj]
+            elif isinstance(obj, (np.integer, np.floating)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+        
+        history = convert_to_serializable(history)
+        
         with open(history_path, 'w') as f:
             json.dump(history, f, indent=2)
         
-        print(f"Training history saved: {history_path}")
+        if self.verbose:
+            print(f"Training history saved: {history_path}")
 
 
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
+def load_preprocessed_data(data_dir: str = './data_zeroshot'):
+    """Load preprocessed XNLI data."""
+    
+    def load_split(split_name):
+        pkl_path = os.path.join(data_dir, f'xnli_{split_name}.pkl')
+        with open(pkl_path, 'rb') as f:
+            data = pickle.load(f)
+        return data
+    
+    train_data = load_split('train')
+    val_data = load_split('validation')
+    test_data = load_split('test')
+    
+    return train_data, val_data, test_data
+
+
 def create_dataloaders(
-    train_texts: List[str],
-    train_labels: List[int],
-    train_lang_ids: List[str],
-    val_texts: Optional[List[str]] = None,
-    val_labels: Optional[List[int]] = None,
-    val_lang_ids: Optional[List[str]] = None,
-    tokenizer = None,
+    train_data: Dict,
+    val_data: Dict,
+    tokenizer,
     batch_size: int = 16,
     max_length: int = 128,
     num_workers: int = 0
-) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """
-    Create training and validation dataloaders.
+):
+    """Create dataloaders from preprocessed data."""
     
-    Args:
-        train_texts: Training texts
-        train_labels: Training labels
-        train_lang_ids: Training language IDs
-        val_texts: Validation texts
-        val_labels: Validation labels
-        val_lang_ids: Validation language IDs
-        tokenizer: Tokenizer
-        batch_size: Batch size
-        max_length: Maximum sequence length
-        num_workers: Number of data loading workers
-    
-    Returns:
-        train_dataloader, val_dataloader (or None)
-    """
-    # Training dataset
     train_dataset = MultilingualDataset(
-        texts=train_texts,
-        labels=train_labels,
-        language_ids=train_lang_ids,
+        texts=train_data['texts'],
+        labels=train_data['labels'],
+        language_ids=train_data['lang_ids'],
         tokenizer=tokenizer,
         max_length=max_length
     )
     
-    train_dataloader = DataLoader(
+    val_dataset = MultilingualDataset(
+        texts=val_data['texts'],
+        labels=val_data['labels'],
+        language_ids=val_data['lang_ids'],
+        tokenizer=tokenizer,
+        max_length=max_length
+    )
+    
+    train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
@@ -572,304 +546,275 @@ def create_dataloaders(
         num_workers=num_workers
     )
     
-    # Validation dataset
-    val_dataloader = None
-    if val_texts is not None:
-        val_dataset = MultilingualDataset(
-            texts=val_texts,
-            labels=val_labels,
-            language_ids=val_lang_ids,
-            tokenizer=tokenizer,
-            max_length=max_length
-        )
-        
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=num_workers
-        )
-    
-    print(f"Created dataloaders:")
-    print(f"  Training samples: {len(train_dataset)}")
-    print(f"  Training batches: {len(train_dataloader)}")
-    if val_dataloader:
-        print(f"  Validation samples: {len(val_dataset)}")
-        print(f"  Validation batches: {len(val_dataloader)}")
-    
-    return train_dataloader, val_dataloader
-
-
-def setup_training(
-    model,
-    train_dataloader,
-    val_dataloader=None,
-    learning_rate: float = 1e-4,
-    num_epochs: int = 10,
-    device: str = 'cuda',
-    output_dir: str = './checkpoints',
-    **trainer_kwargs
-) -> TADRTrainer:
-    """
-    Setup trainer with optimizer and scheduler.
-    
-    Args:
-        model: TADR model
-        train_dataloader: Training dataloader
-        val_dataloader: Validation dataloader
-        learning_rate: Learning rate
-        num_epochs: Number of training epochs
-        device: Device
-        output_dir: Output directory
-        **trainer_kwargs: Additional trainer arguments
-    
-    Returns:
-        Configured TADRTrainer
-    """
-    # Create optimizer
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(
-        trainable_params,
-        lr=learning_rate,
-        weight_decay=0.01
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=num_workers
     )
     
-    # Create scheduler
-    num_training_steps = len(train_dataloader) * num_epochs
-    num_warmup_steps = int(0.1 * num_training_steps)
+    print(f"Dataloaders created:")
+    print(f"  Train: {len(train_dataset)} samples, {len(train_loader)} batches")
+    print(f"  Val: {len(val_dataset)} samples, {len(val_loader)} batches")
     
+    return train_loader, val_loader
+
+
+# ============================================================================
+# MAIN - THIS IS WHAT YOU ASKED FOR!
+# ============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "🚀"*35)
+    print("TADR Framework - Step 7: Training")
+    print("🚀"*35 + "\n")
+    
+    # ========================================================================
+    # CONFIGURATION
+    # ========================================================================
+    
+    # Paths
+    DATA_DIR = './data_zeroshot'
+    OUTPUT_DIR = './tadr_checkpoints'
+    WALS_FILE = 'wals_features.csv'
+    
+    # Model config
+    MODEL_NAME = 'xlm-roberta-base'
+    NUM_ADAPTERS = 8
+    ADAPTER_BOTTLENECK = 48
+    NUM_CLASSES = 3 
+    GATING_TYPE = 'softmax'
+    NUM_ADAPTER_LAYERS = 4 
+    UNFREEZING_STRATEGY = 'full'  # Options: minimal, efficient, aggressive, full
+    
+    # Training config
+    BATCH_SIZE = 8
+    MAX_LENGTH = 128
+    EVAL_STEPS = 200
+    SAVE_STEPS = 500
+    ACCUMULATION_STEPS = 2
+    HYPERPARAMS = {
+        'minimal': {
+            'lr': 5e-4,          # High LR for small parameter set
+            'epochs': 5,         # More epochs needed
+            'classifier_lr_multiplier': 10
+        },
+        'efficient': {
+            'lr': 5e-5,          # Standard BERT fine-tuning LR
+            'epochs': 3,         # Moderate epochs
+            'classifier_lr_multiplier': 5
+        },
+        'aggressive': {
+            'lr': 3e-5,          # Lower LR for more parameters
+            'epochs': 3,         # Fewer epochs (learns faster)
+            'classifier_lr_multiplier': 3
+        },
+        'full': {
+            'lr': 2e-5,          # Lowest LR for all parameters
+            'epochs': 3,         # Fewest epochs (learns very fast)
+            'classifier_lr_multiplier': 1
+        }
+    }
+    LEARNING_RATE = HYPERPARAMS[UNFREEZING_STRATEGY]['lr']
+    NUM_EPOCHS = HYPERPARAMS[UNFREEZING_STRATEGY]['epochs']
+    CLASSIFIER_LR_MULTIPLIER = HYPERPARAMS[UNFREEZING_STRATEGY]['classifier_lr_multiplier']
+
+    
+    # Device
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    print(f"Configuration:")
+    print(f"  Device: {DEVICE}")
+    print(f"  Model: {MODEL_NAME}")
+    print(f"  Batch size: {BATCH_SIZE}")
+    print(f"  Effective batch size: {BATCH_SIZE * ACCUMULATION_STEPS}")
+    print(f"  Epochs: {NUM_EPOCHS}")
+    print(f"  Num adapters: {NUM_ADAPTERS}")
+    print(f"  Adapter layers: {NUM_ADAPTER_LAYERS}")
+    print(f"  Unfreezing strategy: {UNFREEZING_STRATEGY}") 
+    
+    # ========================================================================
+    # STEP 1: LOAD DATA
+    # ========================================================================
+    
+    print(f"\n{'='*70}")
+    print("Step 1: Loading Data")
+    print(f"{'='*70}\n")
+    
+    if not os.path.exists(DATA_DIR):
+        print(f"❌ Error: Data directory '{DATA_DIR}' not found!")
+        print(f"Please run 'python data_preparation_xnli.py' first.")
+        exit(1)
+    
+    train_data, val_data, test_data = load_preprocessed_data(DATA_DIR)
+    
+    print(f"✅ Data loaded:")
+    print(f"  Train: {len(train_data['texts'])} samples")
+    print(f"  Val: {len(val_data['texts'])} samples")
+    print(f"  Test: {len(test_data['texts'])} samples")
+    
+    # ========================================================================
+    # STEP 2: CREATE MODEL
+    # ========================================================================
+    
+    print(f"\n{'='*70}")
+    print("Step 2: Creating TADR Model")
+    print(f"{'='*70}\n")
+    
+    if not os.path.exists(WALS_FILE):
+        print(f"❌ Error: WALS features file '{WALS_FILE}' not found!")
+        print(f"Please ensure wals_features.csv exists in the current directory.")
+        exit(1)
+    
+    model = create_tadr_model(
+        model_name=MODEL_NAME,
+        feature_file=WALS_FILE,
+        num_adapters=NUM_ADAPTERS,
+        adapter_bottleneck=ADAPTER_BOTTLENECK,
+        num_classes=NUM_CLASSES,
+        gating_type=GATING_TYPE,
+        num_adapter_layers=NUM_ADAPTER_LAYERS,
+        device=DEVICE,
+        unfreezing_strategy=UNFREEZING_STRATEGY
+    )
+    
+    print(f"✅ Model created successfully!")
+    
+    # ========================================================================
+    # STEP 3: CREATE DATALOADERS
+    # ========================================================================
+    
+    print(f"\n{'='*70}")
+    print("Step 3: Creating DataLoaders")
+    print(f"{'='*70}\n")
+    
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    train_loader, val_loader = create_dataloaders(
+        train_data=train_data,
+        val_data=val_data,
+        tokenizer=tokenizer,
+        batch_size=BATCH_SIZE,
+        max_length=MAX_LENGTH
+    )
+    
+    # ========================================================================
+    # STEP 4: CREATE LOSS FUNCTION
+    # ========================================================================
+    
+    print(f"\n{'='*70}")
+    print("Step 4: Creating Loss Function")
+    print(f"{'='*70}\n")
+    
+    loss_fn = TADRLoss(
+        task_type="classification",
+        num_classes=NUM_CLASSES,
+        num_adapters=NUM_ADAPTERS,
+        use_load_balancing=False,
+        load_balancing_weight = 0.0
+    )
+    
+    print("✅ Loss function created")
+    
+    # ========================================================================
+    # STEP 5: CREATE TRAINER
+    # ========================================================================
+
+    print(f"\n{'='*70}")
+    print("Step 5: Creating Optimizer and Scheduler")
+    print(f"{'='*70}\n")
+
+    # Manual optimizer with CORRECT learning rate
+    # Create optimizer with separate learning rates
+    classifier_params = []
+    adapter_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if 'classifier' in name:
+                classifier_params.append(param)
+            else:
+                adapter_params.append(param)
+    
+    optimizer = AdamW([
+        {'params': adapter_params, 'lr': LEARNING_RATE},
+        {'params': classifier_params, 'lr': LEARNING_RATE * CLASSIFIER_LR_MULTIPLIER}  # 10x higher for classifier
+    ], weight_decay=0.01)
+    
+    print(f"Optimizer: base_lr={LEARNING_RATE}, classifier_lr={LEARNING_RATE*CLASSIFIER_LR_MULTIPLIER}")
+
+    # Manual scheduler with CORRECT num_epochs
+    num_training_steps = len(train_loader) * NUM_EPOCHS
+    num_warmup_steps = int(0.1 * num_training_steps)
+
+    print(f"\n🔧 Scheduler Debug:")
+    print(f"  NUM_EPOCHS: {NUM_EPOCHS}")
+    print(f"  len(train_loader): {len(train_loader)}")
+    print(f"  num_training_steps: {num_training_steps}")
+    print(f"  Expected: {len(train_loader) * NUM_EPOCHS}")
+    print(f"  Match: {num_training_steps == len(train_loader) * NUM_EPOCHS}")
+
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps
     )
+
+    print(f"✅ Optimizer created:")
+    print(f"  Learning rate: {LEARNING_RATE}")
+    print(f"  Training steps: {num_training_steps}")
+    print(f"  Warmup steps: {num_warmup_steps}")
+
     
-    # Create trainer
+    print(f"\n{'='*70}")
+    print("Step 6: Creating Trainer")
+    print(f"{'='*70}\n")
+    
     trainer = TADRTrainer(
         model=model,
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
+        train_dataloader=train_loader,
+        val_dataloader=val_loader,
         optimizer=optimizer,
         scheduler=scheduler,
-        device=device,
-        output_dir=output_dir,
-        **trainer_kwargs
+        loss_fn=loss_fn,
+        device=DEVICE,
+        output_dir=OUTPUT_DIR,
+        logging_steps=100,
+        eval_steps=EVAL_STEPS,
+        save_steps=SAVE_STEPS,
+        accumulation_steps=ACCUMULATION_STEPS,
+        verbose=True
     )
     
-    return trainer
-
-
-# ============================================================================
-# TESTING AND EXAMPLES
-# ============================================================================
-
-def test_dataset():
-    """Test multilingual dataset."""
-    print("="*60)
-    print("Testing Multilingual Dataset")
-    print("="*60)
+    print("✅ Trainer created")
     
-    from transformers import AutoTokenizer
+    # ========================================================================
+    # STEP 6: TRAIN!
+    # ========================================================================
     
-    # Sample data
-    texts = [
-        "This is a positive review.",
-        "यह एक अच्छी समीक्षा है।",
-        "这是一个积极的评论。",
-        "This is negative.",
-        "यह नकारात्मक है।"
-    ]
-    labels = [1, 1, 1, 0, 0]
-    lang_ids = ['en', 'hi', 'zh', 'en', 'hi']
+    print(f"\n{'='*70}")
+    print("Step 7: Training")
+    print(f"{'='*70}\n")
     
-    # Create dataset
-    tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
+    trainer.train(num_epochs=NUM_EPOCHS)
     
-    dataset = MultilingualDataset(
-        texts=texts,
-        labels=labels,
-        language_ids=lang_ids,
-        tokenizer=tokenizer,
-        max_length=64
-    )
-    
-    print(f"\nDataset size: {len(dataset)}")
-    
-    # Test batch
-    sample = dataset[0]
-    print(f"\nSample item:")
-    print(f"  Input IDs shape: {sample['input_ids'].shape}")
-    print(f"  Attention mask shape: {sample['attention_mask'].shape}")
-    print(f"  Label: {sample['labels']}")
-    print(f"  Language ID: {sample['language_id']}")
-    
-    # Create dataloader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=2,
-        collate_fn=collate_fn
-    )
-    
-    batch = next(iter(dataloader))
-    print(f"\nBatch:")
-    print(f"  Input IDs shape: {batch['input_ids'].shape}")
-    print(f"  Labels shape: {batch['labels'].shape}")
-    print(f"  Language IDs: {batch['language_ids']}")
-    
-    print("\n✅ Dataset test passed!")
+    # ========================================================================
+    # TRAINING COMPLETE
+    # ========================================================================
 
+    print(f"\n{'='*70}")
+    print("✅ TRAINING COMPLETE!")
+    print(f"{'='*70}")
+    print(f"\nTraining Summary:")
+    print(f"  Best validation accuracy: {trainer.best_val_acc:.4f}")
+    print(f"  Best validation loss: {trainer.best_val_loss:.4f}")
+    print(f"  Total epochs: {NUM_EPOCHS}")
+    print(f"  Total training steps: {trainer.global_step}")
 
-def demo_training_setup():
-    """Demonstrate training setup."""
-    print("\n" + "="*60)
-    print("Training Setup Demo")
-    print("="*60)
-    
-    print("""
-# 1. Prepare data
-train_texts = ["text1", "text2", ...]
-train_labels = [0, 1, ...]
-train_lang_ids = ["en", "hi", ...]
+    print(f"\n💾 Model saved to:")
+    print(f"  {OUTPUT_DIR}/best_model.pt (best validation accuracy)")
+    print(f"  {OUTPUT_DIR}/checkpoint_epoch_*.pt (per-epoch checkpoints)")
+    print(f"  {OUTPUT_DIR}/training_history.json (training metrics)")
 
-val_texts = ["val_text1", ...]
-val_labels = [1, ...]
-val_lang_ids = ["zh", ...]
-
-# 2. Create dataloaders
-tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
-
-train_loader, val_loader = create_dataloaders(
-    train_texts=train_texts,
-    train_labels=train_labels,
-    train_lang_ids=train_lang_ids,
-    val_texts=val_texts,
-    val_labels=val_labels,
-    val_lang_ids=val_lang_ids,
-    tokenizer=tokenizer,
-    batch_size=16,
-    max_length=128
-)
-
-# 3. Setup trainer
-trainer = setup_training(
-    model=tadr_model,
-    train_dataloader=train_loader,
-    val_dataloader=val_loader,
-    learning_rate=1e-4,
-    num_epochs=10,
-    device='cuda',
-    output_dir='./checkpoints',
-    logging_steps=100,
-    eval_steps=500,
-    save_steps=1000
-)
-
-# 4. Train
-trainer.train(num_epochs=10)
-
-# 5. Load best model
-trainer.load_checkpoint('checkpoints/best_model.pt')
-
-# 6. Evaluate
-val_metrics = trainer.evaluate()
-    """)
-    
-    print("\n✅ Training setup demo complete!")
-
-
-def demo_full_pipeline():
-    """Demonstrate complete training pipeline."""
-    print("\n" + "="*60)
-    print("Complete Training Pipeline")
-    print("="*60)
-    
-    print("""
-# Complete end-to-end example:
-
-from step1_typology_module import TypologicalFeatureLoader, TypologyFeatureModule
-from step5_integration import create_tadr_model
-from step6_loss_functions import TADRLoss
-from step7_training_loop import create_dataloaders, setup_training
-
-# 1. Create TADR model
-model = create_tadr_model(
-    base_model_name="xlm-roberta-base",
-    typology_feature_file="typology_features.csv",
-    num_adapters=10,
-    adapter_bottleneck=64,
-    num_classes=3,
-    gating_type="topk"
-)
-
-# 2. Prepare loss function
-loss_fn = TADRLoss(
-    task_type="classification",
-    num_classes=3,
-    num_adapters=10,
-    use_load_balancing=True,
-    load_balancing_weight=0.01,
-    use_typology_reg=True,
-    typology_reg_weight=0.005
-)
-
-# 3. Load and prepare data
-# (Assuming you have train/val data loaded)
-train_loader, val_loader = create_dataloaders(
-    train_texts, train_labels, train_lang_ids,
-    val_texts, val_labels, val_lang_ids,
-    tokenizer=model.base_model.tokenizer,
-    batch_size=16
-)
-
-# 4. Setup trainer
-trainer = setup_training(
-    model=model,
-    train_dataloader=train_loader,
-    val_dataloader=val_loader,
-    learning_rate=1e-4,
-    num_epochs=10,
-    device='cuda'
-)
-
-trainer.loss_fn = loss_fn  # Use custom loss
-
-# 5. Train!
-trainer.train(num_epochs=10)
-
-# 6. Test zero-shot transfer
-test_loader = create_test_loader(
-    test_texts,
-    test_labels,
-    ["sw"] * len(test_texts),  # Swahili - unseen language!
-    tokenizer
-)
-
-trainer.model.eval()
-# Model will route based on Swahili's typology automatically!
-    """)
-    
-    print("\n✅ Full pipeline demo complete!")
-
-
-if __name__ == "__main__":
-    print("\n" + "🚀" * 30)
-    print("TADR Framework - Step 7: Training Loop")
-    print("🚀" * 30)
-    
-    # Run tests
-    test_dataset()
-    demo_training_setup()
-    demo_full_pipeline()
-    
-    print("\n" + "="*60)
-    print("✅ Step 7 Complete!")
-    print("="*60)
-    print("\nPhase 3 (Training Pipeline) Complete!")
-    print("\nAll components:")
-    print("  ✅ Step 6: Loss Functions")
-    print("  ✅ Step 7: Training Loop")
-    print("\nNext steps:")
-    print("  → Step 8: Zero-Shot Transfer Testing")
-    print("  → Step 9: Analysis & Visualization")
-    print("="*60 + "\n")
+    print(f"\n{'='*70}\n")
