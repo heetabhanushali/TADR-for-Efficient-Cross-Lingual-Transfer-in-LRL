@@ -4,6 +4,48 @@ __pycache__/
 *.pyo
 *.pyd
 
+# PyTorch & Model Checkpoints (LARGE FILES)
+# ------------------------------------------------------------------------------
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+tadr_checkpoints/
+checkpoints/
+saved_models/
+models/
+
+# Data Files (LARGE FILES)
+# ------------------------------------------------------------------------------
+*.pkl
+*.pickle
+*.hdf5
+*.h5
+data/
+data_zeroshot/
+datasets/
+raw_data/
+processed_data/
+
+# WALS Database Clone (LARGE)
+# ------------------------------------------------------------------------------
+cldf-datasets-wals-*/
+wals/
+wals_data/
+
+# Results & Outputs
+# ------------------------------------------------------------------------------
+zero_shot_results/
+analysis_results/
+results/
+outputs/
+logs/
+runs/
+wandb/
+mlruns/
+*.log
+
 # Virtual environment
 env/
 venv/

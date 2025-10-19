@@ -187,7 +187,7 @@ class TypologyFeatureModule(nn.Module):
         
         # Get raw features
         features = self.feature_loader.get_feature_vector(lang_id)
-        features_tensor = torch.FloatTensor(features).unsqueeze(0)
+        features_tensor = torch.FloatTensor(features).unsqueeze(0).to(next(self.embedding_net.parameters()).device)
         
         # Compute embedding
         with torch.no_grad():
