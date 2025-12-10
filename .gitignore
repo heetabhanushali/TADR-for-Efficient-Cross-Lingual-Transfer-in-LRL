@@ -38,6 +38,7 @@ wals_data/
 # ------------------------------------------------------------------------------
 zero_shot_results/
 analysis_results/
+extended_visualizations/
 results/
 outputs/
 logs/
